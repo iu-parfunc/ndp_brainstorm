@@ -8,6 +8,7 @@
 import Data.Map as M
 import Prelude as P
 import Text.PrettyPrint.GenericPretty (Out(doc,docPrec), Generic)
+import System.Random
 
 ----------------------------------------------------           
 -- Example machine hierarchies:
@@ -20,6 +21,8 @@ quadcpu = Level "socket" static
           , Level "core3" static []
           , Level "core4" static [] ]
 
+-- | A GPU model.  This description mixes static entities (HW) with dynamic entities
+-- (with HW scheduling support) such as kernels, grids, and blocks.
 gpu :: Level
 gpu = Level "gpu" static
       [Level "kernel" [] -- Unlimited DAG of kernels.
@@ -60,7 +63,9 @@ data LevelProp =
 -- TODO: probably need to distinguish which levels can do work independently, if any
 -- non-leaf levels can....
 
---------------------------------------------------
+--------------------------------------------------------------------------------
+-- Fine grained dataflow-graph topology constraints
+--------------------------------------------------------------------------------
 
 data Constraint = Exists (Var -> Constraint)
                 | ForAll (Var -> Constraint)
@@ -82,7 +87,7 @@ type Var = String
 data OpProps = Ordering Constraint
 
 data Op = MAP | FOLD | SCAN
-  deriving (Eq, Show, Read, Ord)
+  deriving (Eq, Show, Read, Ord, Generic)
 -- permute, backpermute, replicate, generate etc etc
 
 opTable :: Map Op OpProps
@@ -97,7 +102,7 @@ opTable = M.fromList $
 -- dependencies for that task (two inputs), each of which may either be an array
 -- element, or the intermediate result produced by another task.
 -- 
--- This ASSUMES that the tasks are indexed by a disjoint set of keys (numbers) than
+-- NOTE: This ASSUMES that the tasks are indexed by a disjoint set of keys (numbers) than
 -- the array subscripts.  Otherwise the Not.Eql bit below is wrong.
 fc :: Var -> Constraint
 fc arr = -- Exists $ \ arr ->
@@ -109,6 +114,41 @@ fc arr = -- Exists $ \ arr ->
       (Task j `Leq` Task i))       `And`
      ((ArrElem arr k `Leq` Task i) `Or`
       (Task k `Leq` Task i))       
+
+--------------------------------------------------------------------------------
+-- Random mappings
+--------------------------------------------------------------------------------
+
+-- A mapping with of a linearly [n] nested task on a linear [d] hierarchy is
+-- straightforward (requires only computing a random subset of n+d positions).  It's
+-- much more complicated when both are trees.
+
+data OpTree a = OpTree Op a [OpTree a]
+  deriving (Eq, Show, Read, Ord, Generic)
+  -- Note: this doesn't really account for operations with multiple lambda arguments
+  -- that could independently contain nested parallel computations....
+
+leaf a = OpTree a () []
+
+-- An OpTree where every Op has been assigned the name of a Level
+type MappedTree = OpTree String
+
+randomMapping :: RandomGen g => Level -> OpTree a -> (MappedTree, g)
+randomMapping = error "finishme"
+
+ex1 = OpTree FOLD () [leaf MAP, leaf FOLD]
+
+--------------------------------------------------------------------------------
+-- Codegen interfaces:
+--------------------------------------------------------------------------------
+
+-- Each level exposes various common concepts (parallel loops, sequential loops) as
+-- well as metadata/properties.
+
+-- Directly invoking codegen tactics at higher levels of abstraction means foregoing
+-- control.  It must always be possible, however, to allow randomly generated
+-- mappings to succeed.
+
 
 --------------------------------------------------------------------------------
 
@@ -143,3 +183,8 @@ instance Show Operand where
 
 instance Out Level
 instance Out LevelProp
+instance Out Op
+instance Out a => Out (OpTree a)
+
+-- A random set of K numbers between 0 and N-1
+-- randKofN k n = 
