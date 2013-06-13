@@ -8,7 +8,7 @@
 import Data.Map as M
 import Prelude as P
 import Text.PrettyPrint.GenericPretty (Out(doc,docPrec), Generic)
-import System.Random
+import System.Random as R
 
 ----------------------------------------------------           
 -- Example machine hierarchies:
@@ -130,14 +130,75 @@ data OpTree a = OpTree Op a [OpTree a]
 
 leaf a = OpTree a () []
 
--- An OpTree where every Op has been assigned the name of a Level
+-- | An OpTree where every Op has been assigned the name of a Level
 type MappedTree = OpTree String
 
-randomMapping :: RandomGen g => Level -> OpTree a -> (MappedTree, g)
-randomMapping = error "finishme"
+-- | Create a random "Natural" (descending) mapping between nested ops and levels of
+-- a machine hierarchy.
+randomMapping :: RandomGen g => Level -> OpTree a -> g -> (MappedTree, g)
+randomMapping mach optree gen = testAndDiscardLoop gen
+  -- TODO: first, simplest implementation.  Randomly assign ops to levels and then
+  -- see if it is a "natural" (descending) mapping.
+  where
+    allLvls (Level str _ chldrn) = str : concatMap allLvls chldrn
+    lvlList = allLvls mach
+    numLvls = length lvlList
+
+    decorate :: [String] -> OpTree a -> OpTree String
+    decorate supply op = head $ fst $ decorLst supply [op]
+    decorLst rands [] = ([],rands)
+    decorLst (target:rst) (OpTree op _ ls : moreops) =
+      let (ls',      rst')  = decorLst rst ls
+          (moreops', rst'') = decorLst rst' moreops in
+      (OpTree op target ls' : moreops', rst'')
+    decorLst [] _ = error "impossible"
+    
+    testAndDiscardLoop g =
+      let (g1,g2)   = R.split g
+          randLvls  = P.map (lvlList!!) $ randomRs (0,numLvls-1) g1
+          candidate = decorate randLvls optree
+      in if verifyOrdered candidate (makeLEQ mach)
+         then (candidate,g2)
+         else testAndDiscardLoop g2
+
+-- | Returns a less-than-or-equal op to capture the depth partial order in a machine
+-- hierarchy.  (Root is "least".)
+--
+-- Really a data structure should be used to cache the transitive closure of this
+-- relation.  `makeLEQ` is just a naive implementation that traverses the whole tree
+-- on each test.
+makeLEQ mach left right
+  | left == right = True
+  | otherwise     = loop mach
+  where
+    loop (Level name _ chlds)
+        | name == left  = any (contains right) chlds
+        | name == right = False
+        | otherwise     = any loop chlds
+    contains name (Level str _ chldrn)
+      | name == str = True
+      | otherwise   = any (contains name) chldrn
+
+-- | Assumes that the LEQ op is a valid partial order.  Thus this only checks
+-- child/parent neighbors in the tree.
+verifyOrdered (OpTree _ tag ls) leq =
+    all (loop tag) ls
+  where
+    loop last (OpTree _ trg chldrn)
+      | last `leq` trg = all (loop trg) chldrn
+      | otherwise      = False
 
 ex1 = OpTree FOLD () [leaf MAP, leaf FOLD]
 
+mp1 = domap gpu     ex1
+mp2 = domap machine ex1
+
+domap mach ex = do
+  g <- getStdGen
+  let (mp,g') = randomMapping mach ex g
+  setStdGen g'
+  return mp  
+  
 --------------------------------------------------------------------------------
 -- Codegen interfaces:
 --------------------------------------------------------------------------------
