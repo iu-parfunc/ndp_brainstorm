@@ -16,18 +16,22 @@ import System.Random as R
 
 quadcpu :: Level
 quadcpu = Level "socket" static
-          [ Level "core1" static []
-          , Level "core2" static []
-          , Level "core3" static []
-          , Level "core4" static [] ]
+          [Level "core" [Sync PtToPt, Bounded 4] []]
+  -- OR:
+          -- [ Level "core1" static []
+          -- , Level "core2" static []
+          -- , Level "core3" static []
+          -- , Level "core4" static [] ]
 
 -- | A GPU model.  This description mixes static entities (HW) with dynamic entities
 -- (with HW scheduling support) such as kernels, grids, and blocks.
 gpu :: Level
 gpu = Level "gpu" static
-      [Level "kernel" [] -- Unlimited DAG of kernels.
-       [Level "block" [Bounded$ 65535 * 65535 * 65535]
-        [Level "thread" [Bounded 1024] []]]]
+      [Level "kernel" [Sync NoSync] -- Unlimited DAG of kernels.
+                                    -- No sync between code inside different kernels.
+       [Level "block" [Sync NoSync, Bounded$ 65535 * 65535 * 65535]
+        [Level "thread" [Sync Barrier, Bounded 1024] []]]]
+        -- Barriers allowed between threads within the same block.
 
 -- | A complete machine could have a CPU and GPU.
 machine :: Level
@@ -41,7 +45,23 @@ static = [Bounded 1]
 -- within a thread or a core.  Some tilings or static schedulings would need to refer
 -- to those explicitly.
 
-------------------------------------------------------------
+-- Example mappings:
+--------------------
+
+ex1 = OpTree FOLD () [leaf MAP, leaf FOLD]
+
+mp1 = domap gpu     ex1
+mp2 = domap machine ex1
+
+domap mach ex = do
+  g <- getStdGen
+  let (mp,g') = randomMapping mach ex g
+  setStdGen g'
+  return mp  
+
+--------------------------------------------------------------------------------
+-- Machine description Schemas
+--------------------------------------------------------------------------------  
 
 -- | A level of a hierarchical machine:
 data Level =
@@ -56,17 +76,37 @@ data Level =
 data LevelProp =
     Bounded Int -- | Max number of entities at this level.  For now they have no
                 -- particular topology; only a cardinatality.
+  | Sync SyncCapability
   | MemModel  -- FinishMe
   | CostModel -- FinishMe
+    -- TODO: topology: DAG, sequence, etc
   deriving (Eq, Show, Read, Ord, Generic)
-
 -- TODO: probably need to distinguish which levels can do work independently, if any
 -- non-leaf levels can....
+
+
+-- | A qualitative description of the synchronization capabalities of a piece of
+-- hardware.  Obviously, a barrier could be implemented with PtToPt, but that would
+-- be expensive.
+data SyncCapability = NoSync -- ^ Separate tasks in the parallel region may not sync.
+                    | PtToPt -- ^ Separate tasks may sync on a pairwise point-to-point basis.
+                    | Barrier -- ^ Separate threads/tasks may partake in a global barrier across the parallel region.
+  deriving (Eq, Show, Read, Ord, Generic)
+  -- TODO: add costs.  For example, on the GPU, within a warp barriers are free,
+  -- whereas __syncthreads within a block is not.
 
 --------------------------------------------------------------------------------
 -- Fine grained dataflow-graph topology constraints
 --------------------------------------------------------------------------------
+-- This part is very speculative.
 
+-- | Graphs of aggregate operators are coarse-grained, but induce fine-grained task
+-- graphs at runtime.  These constraints describe the topology of those fine-grained
+-- graphs.
+--
+-- A far-out goal would be to be able to infer costs from the combination of these
+-- constraints and the cost models associated with machines (and their memory
+-- hierarchies).
 data Constraint = Exists (Var -> Constraint)
                 | ForAll (Var -> Constraint)
                 | And Constraint Constraint
@@ -75,7 +115,6 @@ data Constraint = Exists (Var -> Constraint)
                 | Eql Operand Operand
                 | Leq Operand Operand
 
--- | 
 data Operand = Task Var
              | Var  Var 
              | ArrElem Var Var
@@ -84,15 +123,18 @@ data Operand = Task Var
 type Var = String
 
 -- | The properties of an aggregate operator:
-data OpProps = Ordering Constraint
+data OpProp = Ordering Constraint
+            | NeedsSync SyncCapability
 
 data Op = MAP | FOLD | SCAN
   deriving (Eq, Show, Read, Ord, Generic)
 -- permute, backpermute, replicate, generate etc etc
 
-opTable :: Map Op OpProps
+opTable :: Map Op [OpProp]
 opTable = M.fromList $
-  [ (FOLD, Ordering (fc "arr")) -- Need the name of the input array.
+  [ (FOLD, [ NeedsSync PtToPt,
+             Ordering (fc "arr")]) -- Need the name of the input array.
+  -- TODO: SCAN, MAP, etc
   ]
 
 -- | The fine grained ordering constrainst for a Fold dataflow graph.  Note that fold
@@ -116,13 +158,20 @@ fc arr = -- Exists $ \ arr ->
       (Task k `Leq` Task i))       
 
 --------------------------------------------------------------------------------
--- Random mappings
+-- Random mapping of operators onto machine levels
 --------------------------------------------------------------------------------
 
 -- A mapping with of a linearly [n] nested task on a linear [d] hierarchy is
--- straightforward (requires only computing a random subset of n+d positions).  It's
--- much more complicated when both are trees.
+-- straightforward (requires only computing (n+d) choose n).  It's
+-- much more complicated to count the possibilities when both are trees.
 
+-- | This datatype is not a complete program, but an (easily extracted) simple
+-- abstraction of the nested structure of an NDP program: namely, which operators
+-- contain nested sub-operators.
+-- 
+-- The effect of traditional (NESL-style) NDP flattening transformations is to lift
+-- out and flatten all nested operations which would result in none of these OpTree's
+-- having any children.
 data OpTree a = OpTree Op a [OpTree a]
   deriving (Eq, Show, Read, Ord, Generic)
   -- Note: this doesn't really account for operations with multiple lambda arguments
@@ -187,32 +236,66 @@ verifyOrdered (OpTree _ tag ls) leq =
     loop last (OpTree _ trg chldrn)
       | last `leq` trg = all (loop trg) chldrn
       | otherwise      = False
-
-ex1 = OpTree FOLD () [leaf MAP, leaf FOLD]
-
-mp1 = domap gpu     ex1
-mp2 = domap machine ex1
-
-domap mach ex = do
-  g <- getStdGen
-  let (mp,g') = randomMapping mach ex g
-  setStdGen g'
-  return mp  
   
 --------------------------------------------------------------------------------
 -- Codegen interfaces:
 --------------------------------------------------------------------------------
 
--- Each level exposes various common concepts (parallel loops, sequential loops) as
--- well as metadata/properties.
+-- The idea is that each level exposes various common concepts (parallel loops,
+-- sequential loops) as well as metadata/properties.
 
 -- Directly invoking codegen tactics at higher levels of abstraction means foregoing
 -- control.  It must always be possible, however, to allow randomly generated
 -- mappings to succeed.
 
+-- Case in Point: FOLD
+----------------------
+
+-- The metadata for the fold operator should make clear how many tasks it generates,
+-- their valid topologies, and the sync requirements.
+
+-- The code generator for the fold operator should deal with the level it is assigned
+-- by inspecting its metadata and then invoking its methods to generate parallel or
+-- sequential loops.
+
+-- For example, a common implementation is to have a fold execute as a "block" on the
+-- GPU, enabling barrier synchronization.  The topology selected is not a binary
+-- tree, rather it's several "straight lines" merging into a binary tree at the end.
+-- That is, the first phase is for N threads to independently reduce N chunks of
+-- contiguous (or interleaved) elements in the source.  The second phase is the
+-- binary tree: progressively fewer threads (N/2, N/4) to reduce individual pairs of
+-- elements, with barriers inbetween until there is only one left.
+
+-- (This separation of phases could be reified explicitly by transforming the program
+--  from "fold f arr" into "fold f (map (fold f) (split N arr))".)
+
+-- So a typical codegen for fold looks like a single kernel launching a single
+-- (large) block that first performs a sequential loop and then performs the
+-- alternating barriers and single reductions (with conditionals that cause half the
+-- threads to drop out at each level).
+
+-- IF Fold is assigned a high level in the hierarchy, for example bridging multiple
+-- devices.  Some kind of fissioning of the workload must occur, which perhaps could
+-- happen via explicit program rewritting followed by patching up the mapping.
+
+-- IF Fold is mapped to a leaf thread, then it must generate a single sequential loop.
+    
+-- IF fold is mapped to a level with parallelism but no synchronization between its
+-- children, then it is again forced to fission.  It can do the communication-free
+-- partial reduction in parallel, but the final summing of intermediate results must
+-- happen at a later point either sequentially or in parallel (with synchronization).
+-- This later phase can be anywhere above or below the current level, for example in
+-- a separate kernel after the current one (implicit kernel-level barriers), or on
+-- the CPU host rather than the GPU.
+
+-- [NOTE: the above, simple machine hierarchies need to do more to model the
+-- synchronization that goes on between the GPU and CPU.]
 
 --------------------------------------------------------------------------------
+-- Misc utilities and boilerplate
+--------------------------------------------------------------------------------  
 
+-- TODO: switch this to pretty printing:
 instance Show Constraint where
   show x = fst (loop x nameSupply)
    where
@@ -244,8 +327,7 @@ instance Show Operand where
 
 instance Out Level
 instance Out LevelProp
+instance Out SyncCapability
 instance Out Op
 instance Out a => Out (OpTree a)
 
--- A random set of K numbers between 0 and N-1
--- randKofN k n = 
