@@ -5,6 +5,8 @@
 -- hierarchical architectures.
 --------------------------------------------------------------------------------
 
+module NDP_Hierarchical where
+
 import Data.Map as M
 import Prelude as P
 import Text.PrettyPrint.GenericPretty (Out(doc,docPrec), Generic)
